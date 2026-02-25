@@ -127,8 +127,9 @@ class AudioManager {
       if (result.success) {
         logger.debug("Recording backup saved", { path: result.path, size: result.size }, "audio");
 
-        // Fire-and-forget S3 upload if enabled
-        this._uploadToS3(result.path).catch(() => {});
+        // Await S3 upload so callers that await _saveRecordingBackup
+        // (e.g. _splitRecordingChunk) have the presigned URL ready.
+        await this._uploadToS3(result.path).catch(() => {});
       } else {
         logger.warn("Recording backup failed", { error: result.error }, "audio");
       }
@@ -269,8 +270,9 @@ class AudioManager {
 
       const partIndex = this._chunkPartIndex++;
 
-      // 2. Save the chunk to disk (fire-and-forget)
-      this._saveRecordingBackup(chunkBlob, {
+      // 2. Save the chunk to disk and await S3 upload so the presigned URL
+      //    is available when processWithOpenAIAPI checks for it.
+      await this._saveRecordingBackup(chunkBlob, {
         timestamp: splitTimestamp,
         partIndex,
       });
@@ -542,6 +544,9 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
       this.audioChunks = [];
       this.recordingStartTime = Date.now();
       this.recordingMimeType = this.mediaRecorder.mimeType || "audio/webm";
+      // Clear stale S3 URLs from previous recording sessions so they
+      // don't get used for this recording's transcription.
+      this._pendingS3Keys = [];
 
       this.mediaRecorder.ondataavailable = (event) => {
         this.audioChunks.push(event.data);
@@ -566,15 +571,16 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
           "audio"
         );
 
-        // Save recording backup (fire-and-forget, never blocks transcription)
+        // Save recording backup and await S3 upload so the presigned URL
+        // is available for processWithOpenAIAPI (enables S3-first URL mode).
         if (this._chunkPartIndex === 0) {
           // No chunk splits occurred — save the entire recording
-          this._saveRecordingBackup(audioBlob, {
+          await this._saveRecordingBackup(audioBlob, {
             timestamp: this.recordingStartTime || Date.now(),
           });
         } else {
           // Chunk splits already saved earlier parts; save this final part
-          this._saveRecordingBackup(audioBlob, {
+          await this._saveRecordingBackup(audioBlob, {
             timestamp: this.recordingStartTime || Date.now(),
             partIndex: this._chunkPartIndex,
           });
@@ -1075,7 +1081,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
 
           const renderedBuffer = await offlineContext.startRendering();
           const wavBlob = this.audioBufferToWav(renderedBuffer);
-          resolve(wavBlob);
+          // Only use WAV if it's actually smaller than the original compressed blob
+          if (wavBlob.size < audioBlob.size) {
+            logger.debug("Audio optimized to WAV (smaller)", {
+              originalSize: audioBlob.size,
+              wavSize: wavBlob.size,
+              savings: `${((1 - wavBlob.size / audioBlob.size) * 100).toFixed(1)}%`,
+            }, "audio");
+            resolve(wavBlob);
+          } else {
+            logger.debug("Skipping WAV optimization (would inflate)", {
+              originalSize: audioBlob.size,
+              wavSize: wavBlob.size,
+              inflation: `${((wavBlob.size / audioBlob.size - 1) * 100).toFixed(1)}%`,
+            }, "audio");
+            resolve(audioBlob);
+          }
         } catch (error) {
           // If optimization fails, use original
           resolve(audioBlob);
@@ -1648,12 +1669,12 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         "transcription"
       );
 
-      // For large files: if S3 is configured and we have a presigned URL,
-      // use the `url` parameter instead of uploading the blob directly.
-      // Groq supports this natively. Other providers fall back to file upload.
-      const CLOUD_UPLOAD_LIMIT = 25 * 1024 * 1024; // 25 MB
+      // If S3 is configured and we have a presigned URL, prefer the `url`
+      // parameter over uploading the blob directly. This bypasses upload size
+      // limits entirely. Add providers to this set as they add URL support.
+      const URL_MODE_PROVIDERS = new Set(["groq"]);
       const s3Url = this._getLastS3Url();
-      const useUrlMode = s3Url && optimizedAudio.size > CLOUD_UPLOAD_LIMIT && provider === "groq";
+      const useUrlMode = s3Url && URL_MODE_PROVIDERS.has(provider);
 
       if (useUrlMode) {
         logger.info("Using presigned S3 URL for large file transcription", {
@@ -1663,6 +1684,22 @@ registerProcessor("pcm-streaming-processor", PCMStreamingProcessor);
         }, "transcription");
         formData.append("url", s3Url);
       } else {
+        const CLOUD_UPLOAD_LIMIT = 25 * 1024 * 1024; // 25 MB
+        if (optimizedAudio.size > CLOUD_UPLOAD_LIMIT) {
+          const chunkSplitDisabled = localStorage.getItem("recordingChunkEnabled") === "false";
+          const sizeMB = (optimizedAudio.size / (1024 * 1024)).toFixed(1);
+          logger.warn("Uploading large audio without S3 URL mode", {
+            sizeMB,
+            provider,
+            chunkSplitDisabled,
+          }, "transcription");
+          if (chunkSplitDisabled) {
+            this.onError?.({
+              title: "Large Recording Warning",
+              description: `Audio is ${sizeMB} MB which exceeds the ${(CLOUD_UPLOAD_LIMIT / (1024 * 1024)).toFixed(0)} MB upload limit. Enable S3 cloud storage or chunk splitting in Settings to avoid transcription failures on long recordings.`,
+            });
+          }
+        }
         formData.append("file", optimizedAudio, `audio.${extension}`);
       }
       formData.append("model", model);
